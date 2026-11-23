@@ -7,6 +7,7 @@ import {
   TransactionInstruction,
   VersionedTransaction,
   LAMPORTS_PER_SOL,
+  ComputeBudgetProgram,
 } from "@solana/web3.js";
 import type { Commitment, SignatureStatus } from "@solana/web3.js";
 import {
@@ -14,7 +15,13 @@ import {
   type SolanaPayEscrowManager,
   type ReserveSeatOptions,
   type SeatReservationState,
+  DEFAULT_ESCROW_COMPUTE_UNIT_LIMIT,
+  fetchLatestBlockhashWithBackoff,
 } from "./solanaPayEscrow";
+import {
+  getPriorityFeeEstimator,
+  type PriorityFeeEstimate,
+} from "./priorityFeeEstimator";
 
 export const TOKEN_PROGRAM_ID = new PublicKey(
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -37,6 +44,190 @@ export function getAssociatedTokenAddressSync(
   return address;
 }
 
+export const SOL_DECIMALS = 9;
+export const USDC_DECIMALS = 6;
+
+export type SupportedSettlementAsset = "SOL" | "USDC";
+
+export interface EscrowBookingQuoteInput {
+  /** Hourly rate as a decimal string (e.g., "0.14" SOL or "4.50" USDC) */
+  hourlyRate: string | number;
+  /** Booking duration in minutes (e.g., 90 for 1.5 hours) */
+  durationMinutes: number;
+  /** Settlement token ('SOL' = 9 decimals, 'USDC' = 6 decimals) */
+  asset?: SupportedSettlementAsset;
+  /** Optional explicit decimal precision override */
+  decimals?: number;
+}
+
+export interface EscrowBaseUnitQuote {
+  asset: SupportedSettlementAsset;
+  decimals: number;
+  baseUnits: bigint;
+  formattedDecimal: string;
+}
+
+/**
+ * Converts a decimal token amount into exact integer base units (`bigint`) using
+ * string splitting and right-padding—eliminating IEEE-754 floating-point drift
+ * (such as `0.14 * 1e9` or `1.005 * 1e6`).
+ */
+export function parseDecimalToBaseUnits(
+  amount: string | number,
+  decimals: number = SOL_DECIMALS,
+): bigint {
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) {
+    throw new RangeError(`Invalid token decimal precision: ${decimals}`);
+  }
+
+  const raw =
+    typeof amount === "number"
+      ? Number.isFinite(amount)
+        ? amount.toString()
+        : ""
+      : typeof amount === "string"
+        ? amount.trim()
+        : "";
+
+  if (!raw) {
+    throw new Error("Token amount must be a non-empty finite decimal string");
+  }
+
+  // Handle scientific notation strings (e.g. "1e-7") safely into fixed decimal representation
+  const normalized = expandScientificNotation(raw);
+
+  if (normalized.startsWith("-")) {
+    throw new Error(`Token amount cannot be negative: "${raw}"`);
+  }
+
+  const unsigned = normalized.startsWith("+")
+    ? normalized.slice(1)
+    : normalized;
+  const parts = unsigned.split(".");
+
+  if (parts.length > 2) {
+    throw new Error(`Malformed decimal amount: "${raw}"`);
+  }
+
+  const wholePartRaw = parts[0] === "" ? "0" : parts[0];
+  const fractionPartRaw = parts[1] ?? "";
+
+  if (
+    !/^\d+$/.test(wholePartRaw) ||
+    (fractionPartRaw !== "" && !/^\d+$/.test(fractionPartRaw))
+  ) {
+    throw new Error(`Invalid numeric characters in decimal amount: "${raw}"`);
+  }
+
+  if (fractionPartRaw.length > decimals) {
+    const excessDigits = fractionPartRaw.slice(decimals);
+    if (!/^0+$/.test(excessDigits)) {
+      throw new Error(
+        `Amount "${raw}" exceeds maximum supported precision of ${decimals} decimal places`,
+      );
+    }
+  }
+
+  const paddedFraction =
+    decimals === 0
+      ? ""
+      : fractionPartRaw.slice(0, decimals).padEnd(decimals, "0");
+
+  return BigInt(`${wholePartRaw}${paddedFraction}`);
+}
+
+/**
+ * Formats integer base units (`bigint`) back into a canonical decimal string without float loss.
+ */
+export function formatBaseUnitsToDecimal(
+  baseUnits: bigint,
+  decimals: number = SOL_DECIMALS,
+): string {
+  if (baseUnits < 0n) {
+    throw new Error("Base units cannot be negative");
+  }
+
+  if (decimals === 0) {
+    return baseUnits.toString();
+  }
+
+  const digits = baseUnits.toString().padStart(decimals + 1, "0");
+  const whole = digits.slice(0, -decimals);
+  const fraction = digits.slice(-decimals).replace(/0+$/, "");
+
+  return fraction.length > 0 ? `${whole}.${fraction}` : whole;
+}
+
+/**
+ * Expands valid scientific-notation numeric strings (e.g. "5e-8") into plain fixed-point strings.
+ */
+function expandScientificNotation(value: string): string {
+  const match = /^([+-]?)(\d+)(?:\.(\d*))?[eE]([+-]?\d+)$/.exec(value);
+  if (!match) {
+    return value;
+  }
+
+  const [, sign, intDigits, fracDigits = "", expStr] = match;
+  const exponent = parseInt(expStr, 10);
+  const combinedDigits = `${intDigits}${fracDigits}`;
+  const decimalPosition = intDigits.length + exponent;
+
+  if (decimalPosition <= 0) {
+    return `${sign}0.${"0".repeat(Math.abs(decimalPosition))}${combinedDigits}`;
+  }
+
+  if (decimalPosition >= combinedDigits.length) {
+    return `${sign}${combinedDigits}${"0".repeat(decimalPosition - combinedDigits.length)}`;
+  }
+
+  return `${sign}${combinedDigits.slice(0, decimalPosition)}.${combinedDigits.slice(decimalPosition)}`;
+}
+
+/**
+ * Computes exact escrow base units (`lamports` for SOL, micro-units for USDC) for a
+ * prorated multi-minute desk reservation using pure `BigInt` integer arithmetic.
+ */
+export function calculateEscrowBookingBaseUnits(
+  input: EscrowBookingQuoteInput,
+): EscrowBaseUnitQuote {
+  const asset: SupportedSettlementAsset = input.asset ?? "SOL";
+  const decimals =
+    input.decimals ?? (asset === "USDC" ? USDC_DECIMALS : SOL_DECIMALS);
+
+  if (!Number.isInteger(input.durationMinutes) || input.durationMinutes <= 0) {
+    throw new Error("Booking durationMinutes must be a positive integer");
+  }
+
+  const hourlyBaseUnits = parseDecimalToBaseUnits(input.hourlyRate, decimals);
+  const totalBaseUnits =
+    (hourlyBaseUnits * BigInt(input.durationMinutes)) / 60n;
+
+  return {
+    asset,
+    decimals,
+    baseUnits: totalBaseUnits,
+    formattedDecimal: formatBaseUnitsToDecimal(totalBaseUnits, decimals),
+  };
+}
+
+/**
+ * Validates that a connected wallet's pre-flight balance (plus Solana fee buffer)
+ * covers the exact `BigInt` escrow transfer amount before signing.
+ */
+export function assertSufficientEscrowBalance(params: {
+  walletBalanceBaseUnits: bigint;
+  requiredEscrowBaseUnits: bigint;
+  networkFeeReserveBaseUnits?: bigint;
+}): void {
+  const feeReserve = params.networkFeeReserveBaseUnits ?? 5_000n; // 5,000 lamports default signature fee
+  const totalRequired = params.requiredEscrowBaseUnits + feeReserve;
+
+  if (params.walletBalanceBaseUnits < totalRequired) {
+    throw new Error(
+      `InsufficientFunds: wallet balance ${params.walletBalanceBaseUnits.toString()} is less than required ${totalRequired.toString()} base units`,
+    );
+  }
+}
 export function createTransferInstruction(
   source: PublicKey,
   destination: PublicKey,
@@ -67,7 +258,6 @@ export const USDC_MINT = new PublicKey(
   process.env.NEXT_PUBLIC_USDC_MINT ??
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
 );
-export const USDC_DECIMALS = 6;
 
 export type EscrowCurrency = "SOL" | "USDC";
 
@@ -77,6 +267,8 @@ export interface EscrowDepositParams {
   amount: number;
   currency: EscrowCurrency;
   rpcUrl: string;
+  priorityFeeMicroLamports?: number;
+  computeUnitLimit?: number;
 }
 
 export interface EscrowDepositResult {
@@ -85,6 +277,7 @@ export interface EscrowDepositResult {
   escrowBump: number;
   amountBaseUnits: bigint;
   recentBlockhash: string;
+  lastValidBlockHeight?: number;
 }
 
 export interface EscrowValidationResult {
@@ -169,12 +362,58 @@ export async function buildSolDepositTransaction(
   const amountBaseUnits = toBaseUnits(params.amount, "SOL");
 
   const connection = new Connection(params.rpcUrl, "confirmed");
-  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash("confirmed");
 
   const transaction = new Transaction({
     recentBlockhash: blockhash,
     feePayer: payer,
   });
+
+  // Dynamic Compute Unit Budget: set dedicated compute unit limit
+  const computeUnitLimit =
+    params.computeUnitLimit ?? DEFAULT_ESCROW_COMPUTE_UNIT_LIMIT;
+  if (typeof computeUnitLimit === "number" && computeUnitLimit > 0) {
+    transaction.add(
+      ComputeBudgetProgram.setComputeUnitLimit({
+        units: Math.floor(computeUnitLimit),
+      }),
+    );
+  }
+
+  // Dynamic Priority Fee: estimate automatically if not explicitly provided
+  let priorityFee = params.priorityFeeMicroLamports;
+  if (priorityFee === undefined || priorityFee === null) {
+    try {
+      const estimator = getPriorityFeeEstimator();
+      const estimate = await estimator.estimatePriorityFee(connection, [
+        payer,
+        escrowVault,
+      ]);
+      priorityFee = estimate.microLamports;
+    } catch {
+      priorityFee = undefined;
+    }
+  }
+
+  // SetComputeUnitPrice must be placed before business instructions
+  if (typeof priorityFee === "number" && priorityFee > 0) {
+    const safeFee = Math.max(0, Math.floor(priorityFee));
+    const existingIndex = transaction.instructions.findIndex(
+      (ix) =>
+        ix.programId.equals(ComputeBudgetProgram.programId) &&
+        ix.data.length > 0 &&
+        ix.data[0] === 3,
+    );
+    const computeIx = ComputeBudgetProgram.setComputeUnitPrice({
+      microLamports: safeFee,
+    });
+    if (existingIndex >= 0) {
+      transaction.instructions[existingIndex] = computeIx;
+    } else {
+      transaction.instructions.unshift(computeIx);
+    }
+  }
 
   const memoData = Buffer.from(
     JSON.stringify({ bookingId: params.bookingId, type: "escrow_deposit" }),
@@ -203,6 +442,7 @@ export async function buildSolDepositTransaction(
     escrowBump: bump,
     amountBaseUnits,
     recentBlockhash: blockhash,
+    lastValidBlockHeight,
   };
 }
 
@@ -219,7 +459,8 @@ export async function buildUsdcDepositTransaction(
   const amountBaseUnits = toBaseUnits(params.amount, "USDC");
 
   const connection = new Connection(params.rpcUrl, "confirmed");
-  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash("confirmed");
 
   const payerAta = getAssociatedTokenAddressSync(
     USDC_MINT,
@@ -240,6 +481,52 @@ export async function buildUsdcDepositTransaction(
     recentBlockhash: blockhash,
     feePayer: payer,
   });
+
+  // Dynamic Compute Unit Budget: set dedicated compute unit limit
+  const computeUnitLimit =
+    params.computeUnitLimit ?? DEFAULT_ESCROW_COMPUTE_UNIT_LIMIT;
+  if (typeof computeUnitLimit === "number" && computeUnitLimit > 0) {
+    transaction.add(
+      ComputeBudgetProgram.setComputeUnitLimit({
+        units: Math.floor(computeUnitLimit),
+      }),
+    );
+  }
+
+  // Dynamic Priority Fee: estimate automatically if not explicitly provided
+  let priorityFee = params.priorityFeeMicroLamports;
+  if (priorityFee === undefined || priorityFee === null) {
+    try {
+      const estimator = getPriorityFeeEstimator();
+      const estimate = await estimator.estimatePriorityFee(connection, [
+        payer,
+        payerAta,
+        vaultAta,
+      ]);
+      priorityFee = estimate.microLamports;
+    } catch {
+      priorityFee = undefined;
+    }
+  }
+
+  // SetComputeUnitPrice must be placed before business instructions
+  if (typeof priorityFee === "number" && priorityFee > 0) {
+    const safeFee = Math.max(0, Math.floor(priorityFee));
+    const existingIndex = transaction.instructions.findIndex(
+      (ix) =>
+        ix.programId.equals(ComputeBudgetProgram.programId) &&
+        ix.data.length > 0 &&
+        ix.data[0] === 3,
+    );
+    const computeIx = ComputeBudgetProgram.setComputeUnitPrice({
+      microLamports: safeFee,
+    });
+    if (existingIndex >= 0) {
+      transaction.instructions[existingIndex] = computeIx;
+    } else {
+      transaction.instructions.unshift(computeIx);
+    }
+  }
 
   const memoData = Buffer.from(
     JSON.stringify({
@@ -274,6 +561,7 @@ export async function buildUsdcDepositTransaction(
     escrowBump: bump,
     amountBaseUnits,
     recentBlockhash: blockhash,
+    lastValidBlockHeight,
   };
 }
 
@@ -338,9 +626,9 @@ export async function verifyDeposit(
   signature: string,
   expectedParams: {
     bookingId: string;
-    payerWallet: string;
-    amount: number;
-    currency: EscrowCurrency;
+    payerWallet?: string;
+    amount?: number;
+    currency?: EscrowCurrency;
   },
   rpcUrl: string,
 ): Promise<{
@@ -348,6 +636,7 @@ export async function verifyDeposit(
   error?: string;
   escrowVault?: string;
   amountBaseUnits?: bigint;
+  payerWallet?: string;
 }> {
   if (!signature) {
     return { verified: false, error: "Transaction signature is required" };
@@ -372,25 +661,33 @@ export async function verifyDeposit(
     }
 
     const { address: escrowVault } = deriveEscrowPDA(expectedParams.bookingId);
-    const expectedAmount = toBaseUnits(
-      expectedParams.amount,
-      expectedParams.currency,
-    );
-    const payer = new PublicKey(expectedParams.payerWallet);
+    const currency = expectedParams.currency ?? "SOL";
+    const expectedAmount =
+      expectedParams.amount !== undefined && expectedParams.amount > 0
+        ? toBaseUnits(expectedParams.amount, currency)
+        : undefined;
 
     const accountKeys = tx.transaction.message.accountKeys;
-    const payerKey = accountKeys.find(
-      (k) => k.pubkey.equals(payer) && k.signer,
-    );
-    if (!payerKey) {
-      return { verified: false, error: "Expected payer is not a signer" };
+    let payerKey: any;
+    if (expectedParams.payerWallet) {
+      const payer = new PublicKey(expectedParams.payerWallet);
+      payerKey = accountKeys.find((k) => k.pubkey.equals(payer) && k.signer);
+      if (!payerKey) {
+        return { verified: false, error: "Expected payer is not a signer" };
+      }
+    } else {
+      payerKey = accountKeys.find((k) => k.signer);
+      if (!payerKey) {
+        return { verified: false, error: "No signer found in transaction" };
+      }
     }
+    const detectedPayer = (payerKey.pubkey as PublicKey).toBase58();
 
     const vaultIndex = accountKeys.findIndex((k) =>
       k.pubkey.equals(escrowVault),
     );
 
-    if (expectedParams.currency === "SOL") {
+    if (currency === "SOL" && expectedAmount !== undefined) {
       if (vaultIndex === -1) {
         return {
           verified: false,
@@ -407,12 +704,18 @@ export async function verifyDeposit(
           error: `Insufficient deposit: expected ${expectedAmount}, received ${received}`,
         };
       }
+    } else if (vaultIndex === -1) {
+      return {
+        verified: false,
+        error: "Escrow vault not found in transaction accounts",
+      };
     }
 
     return {
       verified: true,
       escrowVault: escrowVault.toBase58(),
       amountBaseUnits: expectedAmount,
+      payerWallet: detectedPayer,
     };
   } catch (e: unknown) {
     return {
@@ -775,6 +1078,51 @@ export async function simulateEscrowTransaction(
   };
 }
 
+/** Hard ceiling for a single RPC status/balance poll request. */
+export const ESCROW_RPC_POLL_TIMEOUT_MS = 5_000;
+
+/**
+ * Runs one RPC poll request under an explicit abort deadline.
+ *
+ * `@solana/web3.js` does not abort in-flight requests on its own, so when a
+ * node blackholes packets (no TCP RST) the returned promise never settles and
+ * the caller's retry loop stalls forever. This helper hands the operation an
+ * `AbortSignal` and also races it against that signal, so the caller always
+ * gets a rejection (`EscrowRpcTimeoutError`) once `timeoutMs` elapses.
+ */
+export async function withRpcPollTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  options: { timeoutMs?: number; endpoint?: string } = {},
+): Promise<T> {
+  const timeoutMs =
+    typeof options.timeoutMs === "number" &&
+    Number.isFinite(options.timeoutMs) &&
+    options.timeoutMs > 0
+      ? options.timeoutMs
+      : ESCROW_RPC_POLL_TIMEOUT_MS;
+  const endpoint = options.endpoint ?? "rpc-poll";
+
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const timeoutError = new EscrowRpcTimeoutError(timeoutMs, endpoint);
+      controller.abort(timeoutError);
+      reject(timeoutError);
+    }, timeoutMs);
+    (timer as { unref?: () => void }).unref?.();
+  });
+
+  try {
+    return await Promise.race([operation(controller.signal), deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    // A late rejection from the abandoned operation must not go unhandled.
+    deadline.catch(() => {});
+  }
+}
+
 /**
  * Background worker verifying on-chain transaction finalization.
  */
@@ -787,9 +1135,14 @@ export async function reconcilePendingSignature({
   let attempts = 0;
   while (attempts < maxRetries) {
     try {
-      const status = await connection.getSignatureStatus(signature, {
-        searchTransactionHistory: true,
-      });
+      // A timeout rejects into the catch below, which counts it as a retry.
+      const status = await withRpcPollTimeout(
+        () =>
+          connection.getSignatureStatus(signature, {
+            searchTransactionHistory: true,
+          }),
+        { endpoint: "reconcilePendingSignature" },
+      );
 
       const confirmation = status.value;
       if (confirmation) {
@@ -1522,6 +1875,7 @@ export interface SubmitEscrowRefundParams {
   onSigned?: (signature: string) => Promise<void> | void;
   confirmationTimeoutMs?: number;
   pollIntervalMs?: number;
+  priorityFeeMicroLamports?: number;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -1621,6 +1975,44 @@ export async function submitEscrowRefundTransaction(
       recentBlockhash: blockhash,
       feePayer: authority.publicKey,
     });
+
+    // Dynamic Priority Fee: estimate automatically if not explicitly provided
+    let priorityFee = params.priorityFeeMicroLamports;
+    if (priorityFee === undefined || priorityFee === null) {
+      try {
+        const estimator = getPriorityFeeEstimator();
+        const estimate = (await pool.execute((conn) =>
+          estimator.estimatePriorityFee(conn, [
+            address,
+            authority.publicKey,
+            depositor,
+          ]),
+        )) as PriorityFeeEstimate;
+        priorityFee = estimate.microLamports;
+      } catch {
+        priorityFee = undefined;
+      }
+    }
+
+    // SetComputeUnitPrice must be placed at instruction index 0 before business instructions
+    if (typeof priorityFee === "number" && priorityFee > 0) {
+      const safeFee = Math.max(0, Math.floor(priorityFee));
+      const existingIndex = transaction.instructions.findIndex(
+        (ix) =>
+          ix.programId.equals(ComputeBudgetProgram.programId) &&
+          ix.data.length > 0 &&
+          ix.data[0] === 3,
+      );
+      const computeIx = ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: safeFee,
+      });
+      if (existingIndex >= 0) {
+        transaction.instructions[existingIndex] = computeIx;
+      } else {
+        transaction.instructions.unshift(computeIx);
+      }
+    }
+
     transaction.add(instruction);
     transaction.sign(authority);
 
@@ -2147,6 +2539,20 @@ export class EscrowRpcConnectionPool {
     return this.getConnection(endpoint);
   }
 
+  /**
+   * Connection for one specific endpoint of the pool, creating it on first use.
+   * Rejects for an endpoint that is not part of this pool.
+   */
+  public async getConnectionForEndpoint(endpoint: string): Promise<Connection> {
+    if (!this.endpoints.includes(endpoint)) {
+      throw new EscrowRpcFailoverError(
+        [],
+        `RPC endpoint ${endpoint} is not part of this pool`,
+      );
+    }
+    return this.getConnection(endpoint);
+  }
+
   /** Snapshot of per-endpoint health across the cluster. */
   public getHealthReport(): EscrowRpcEndpointHealth[] {
     return this.endpoints.map((endpoint) => {
@@ -2456,6 +2862,16 @@ export class EscrowClient {
     return this.pool.execute((connection) => connection.getLatestBlockhash());
   }
 
+  /** Fetches the latest blockhash with exponential backoff on transient RPC errors. */
+  public async getLatestBlockhashWithRetry(
+    maxRetries = 3,
+    baseBackoffMs = 500,
+  ): Promise<{ blockhash: string; lastValidBlockHeight: number }> {
+    return this.pool.execute((connection) =>
+      fetchLatestBlockhashWithBackoff(connection, maxRetries, baseBackoffMs),
+    );
+  }
+
   /** Fetches a transaction's signature status through the failover pool. */
   public async getSignatureStatus(
     signature: string,
@@ -2490,6 +2906,20 @@ export class EscrowClient {
       pollSignatureStatus: (signature) => this.getSignatureStatus(signature),
     });
   }
+
+  /**
+   * Subscribes to signature confirmation via WebSocket with automatic two-stage
+   * HTTP polling fallback.
+   */
+  public subscribeToConfirmation(
+    signature: string,
+    options?: Omit<SubscribeToEscrowConfirmationOptions, "pool">,
+  ): EscrowConfirmationSubscription {
+    return subscribeToEscrowConfirmation(signature, {
+      ...options,
+      pool: this.pool,
+    });
+  }
 }
 
 let defaultEscrowClient: EscrowClient | null = null;
@@ -2510,4 +2940,867 @@ export function resetEscrowClient(): void {
   defaultEscrowClient = null;
 }
 
+// ===========================================================================
+// WebSocket Confirmation Streaming & Monotonic State Machine (#7773)
+// ===========================================================================
+
+export type EscrowConfirmationStatus =
+  | "pending"
+  | "processed"
+  | "confirmed"
+  | "finalized"
+  | "fallback_polling"
+  | "failed"
+  | "timeout";
+
+export type EscrowConfirmationSource = "websocket" | "http_polling";
+
+export interface EscrowConfirmationEvent {
+  signature: string;
+  status: EscrowConfirmationStatus;
+  source: EscrowConfirmationSource;
+  slot?: number | null;
+  error?: string | null;
+  timestamp: number;
+}
+
+export interface EscrowConfirmationCallbacks {
+  onStatusChange?: (event: EscrowConfirmationEvent) => void;
+  onProcessed?: (event: EscrowConfirmationEvent) => void;
+  onConfirmed?: (event: EscrowConfirmationEvent) => void;
+  onFinalized?: (event: EscrowConfirmationEvent) => void;
+  onFallbackPolling?: (event: EscrowConfirmationEvent) => void;
+  onError?: (error: Error, event: EscrowConfirmationEvent) => void;
+  onTimeout?: (event: EscrowConfirmationEvent) => void;
+}
+
+export interface SubscribeToEscrowConfirmationOptions {
+  connection?: Connection;
+  pool?: EscrowRpcConnectionPool;
+  commitment?: "processed" | "confirmed" | "finalized";
+  confirmTimeoutMs?: number; // Stage 1 watchdog: 30s default
+  confirmationTimeoutMs?: number; // alias
+  finalizeTimeoutMs?: number; // Stage 2 watchdog: 15s default
+  finalizationTimeoutMs?: number; // alias
+  overallTimeoutMs?: number; // Overall budget timeout: 55s default
+  pollIntervalMs?: number; // HTTP fallback poll initial interval: 2s or 500ms default
+  httpPollingIntervalMs?: number; // alias
+  minPollIntervalMs?: number; // Minimum backoff interval (default: 500ms)
+  maxPollIntervalMs?: number; // Maximum backoff cap (default: 8000ms)
+  pollBackoffMultiplier?: number; // Exponential backoff multiplier (default: 2.0)
+  lastValidBlockHeight?: number; // For blockhash expiration detection
+  callbacks?: EscrowConfirmationCallbacks;
+  pollSignatureStatus?: (signature: string) => Promise<SignatureStatus | null>;
+  onWebSocketDisconnect?: (reason?: string) => void;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export interface EscrowConfirmationSubscription {
+  signature: string;
+  getStatus: () => EscrowConfirmationStatus;
+  getLatestEvent: () => EscrowConfirmationEvent;
+  unsubscribe: () => void;
+  promise: Promise<EscrowConfirmationEvent>;
+}
+
+export const ESCROW_CONFIRM_WATCHDOG_MS = 30_000;
+export const ESCROW_FINALIZE_WATCHDOG_MS = 15_000;
+export const ESCROW_STREAMING_OVERALL_TIMEOUT_MS = 55_000;
+export const ESCROW_STREAMING_POLL_INTERVAL_MS = 2_000;
+export const ESCROW_MIN_POLL_INTERVAL_MS = 500;
+export const ESCROW_MAX_POLL_INTERVAL_MS = 8_000;
+export const ESCROW_POLL_BACKOFF_MULTIPLIER = 2.0;
+
+export class EscrowConfirmationStateMachine {
+  private currentStatus: EscrowConfirmationStatus = "pending";
+  private currentSource: EscrowConfirmationSource = "websocket";
+  private currentCommitmentRank = 0; // 0: none/pending, 1: processed, 2: confirmed, 3: finalized
+  private _isTerminal = false;
+  private latestEvent: EscrowConfirmationEvent;
+  private readonly signature: string;
+  private readonly callbacks?: EscrowConfirmationCallbacks;
+  private readonly now: () => number;
+  private listeners: Array<(event: EscrowConfirmationEvent) => void> = [];
+  public readonly promise: Promise<EscrowConfirmationEvent>;
+  private resolvePromise!: (value: EscrowConfirmationEvent) => void;
+  private rejectPromise!: (reason: any) => void;
+
+  constructor(
+    signature: string,
+    callbacks?: EscrowConfirmationCallbacks,
+    now: () => number = Date.now,
+  ) {
+    this.signature = signature;
+    this.callbacks = callbacks;
+    this.now = now;
+    this.latestEvent = {
+      signature,
+      status: "pending",
+      source: "websocket",
+      slot: null,
+      error: null,
+      timestamp: this.now(),
+    };
+
+    this.promise = new Promise<EscrowConfirmationEvent>((resolve, reject) => {
+      this.resolvePromise = resolve;
+      this.rejectPromise = reject;
+    });
+  }
+
+  public abort(reason = "Subscription cancelled"): void {
+    if (this._isTerminal) return;
+    this._isTerminal = true;
+    const err = new Error(reason);
+    this.promise.catch(() => {});
+    this.rejectPromise(err);
+  }
+
+  public getStatus(): EscrowConfirmationStatus {
+    return this.currentStatus;
+  }
+
+  public getCommitmentRank(): number {
+    return this.currentCommitmentRank;
+  }
+
+  public getLatestEvent(): EscrowConfirmationEvent {
+    return { ...this.latestEvent };
+  }
+
+  public isDone(): boolean {
+    return this._isTerminal;
+  }
+
+  public isTerminal(): boolean {
+    return this._isTerminal;
+  }
+
+  public subscribe(
+    listener: (event: EscrowConfirmationEvent) => void,
+  ): () => void {
+    this.listeners.push(listener);
+    return () => {
+      this.listeners = this.listeners.filter((l) => l !== listener);
+    };
+  }
+
+  public transition(
+    newStatus: EscrowConfirmationStatus,
+    sourceOrOptions?:
+      | EscrowConfirmationSource
+      | { slot?: number | null; error?: string | null; reason?: string },
+    optionsParam?: {
+      slot?: number | null;
+      error?: string | null;
+      reason?: string;
+    },
+  ): EscrowConfirmationEvent | null {
+    if (this._isTerminal) {
+      return null;
+    }
+
+    let source: EscrowConfirmationSource = "websocket";
+    let options: {
+      slot?: number | null;
+      error?: string | null;
+      reason?: string;
+    } = {};
+
+    if (typeof sourceOrOptions === "string") {
+      source = sourceOrOptions;
+      if (optionsParam) options = optionsParam;
+    } else if (
+      typeof sourceOrOptions === "object" &&
+      sourceOrOptions !== null
+    ) {
+      options = sourceOrOptions;
+    }
+
+    // Determine commitment rank
+    let targetRank = this.currentCommitmentRank;
+    if (newStatus === "processed") targetRank = 1;
+    else if (newStatus === "confirmed") targetRank = 2;
+    else if (newStatus === "finalized") targetRank = 3;
+
+    // Reject out-of-order commitment regressions
+    // e.g. processed arriving when already confirmed (1 < 2)
+    if (
+      (newStatus === "processed" ||
+        newStatus === "confirmed" ||
+        newStatus === "finalized") &&
+      targetRank < this.currentCommitmentRank
+    ) {
+      return null;
+    }
+
+    // Duplicate event check
+    if (
+      newStatus === this.currentStatus &&
+      targetRank === this.currentCommitmentRank &&
+      newStatus !== "fallback_polling"
+    ) {
+      return null;
+    }
+
+    // Update state
+    this.currentStatus = newStatus;
+    this.currentSource = source;
+    if (targetRank > this.currentCommitmentRank) {
+      this.currentCommitmentRank = targetRank;
+    }
+
+    const event: EscrowConfirmationEvent = {
+      signature: this.signature,
+      status: newStatus,
+      source,
+      slot: options.slot ?? this.latestEvent.slot ?? null,
+      error: options.error ?? null,
+      timestamp: this.now(),
+    };
+    this.latestEvent = event;
+
+    // Check terminal
+    if (
+      newStatus === "finalized" ||
+      newStatus === "failed" ||
+      newStatus === "timeout"
+    ) {
+      this._isTerminal = true;
+      if (newStatus === "finalized") {
+        this.resolvePromise(event);
+      } else {
+        const err = new Error(
+          options.error || `Escrow confirmation ended in state: ${newStatus}`,
+        );
+        // Avoid unhandled rejection crash if caller doesn't attach .catch to promise
+        this.promise.catch(() => {});
+        this.rejectPromise(err);
+      }
+    }
+
+    // Fire listeners and callbacks safely
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch (lErr) {
+        console.error("[EscrowStateMachine] Error in listener:", lErr);
+      }
+    }
+
+    try {
+      this.callbacks?.onStatusChange?.(event);
+      if (newStatus === "processed") this.callbacks?.onProcessed?.(event);
+      else if (newStatus === "confirmed") this.callbacks?.onConfirmed?.(event);
+      else if (newStatus === "finalized") {
+        this.callbacks?.onFinalized?.(event);
+      } else if (newStatus === "fallback_polling") {
+        this.callbacks?.onFallbackPolling?.(event);
+      } else if (newStatus === "failed") {
+        const err = new Error(options.error || "Escrow confirmation failed");
+        this.callbacks?.onError?.(err, event);
+      } else if (newStatus === "timeout") {
+        this.callbacks?.onTimeout?.(event);
+      }
+    } catch (cbErr) {
+      console.error("[EscrowStateMachine] Error in callback:", cbErr);
+    }
+
+    return event;
+  }
+}
+
+/**
+ * Subscribes to Solana transaction signature confirmation via WebSocket RPC subscriptions
+ * with automatic two-stage fallback to HTTP polling.
+ *
+ * Stage 1 (0-30s): Listens on WebSocket at processed, confirmed, and finalized commitment.
+ * If confirmed/finalized is not received within 30s, transitions to fallback_polling.
+ * Stage 2: Once confirmed, if finalized is not received within 15s, maintains HTTP polling until finality.
+ * Overall budget (55s): Terminates safely before serverless execution boundaries.
+ */
+export function subscribeToEscrowConfirmation(
+  signature: string,
+  options: SubscribeToEscrowConfirmationOptions = {},
+): EscrowConfirmationSubscription {
+  if (!signature || typeof signature !== "string" || !signature.trim()) {
+    throw new Error("Valid transaction signature is required");
+  }
+  const cleanSignature = signature.trim();
+
+  const confirmTimeoutMs =
+    options.confirmationTimeoutMs ??
+    options.confirmTimeoutMs ??
+    ESCROW_CONFIRM_WATCHDOG_MS;
+  const finalizeTimeoutMs =
+    options.finalizationTimeoutMs ??
+    options.finalizeTimeoutMs ??
+    ESCROW_FINALIZE_WATCHDOG_MS;
+  const overallTimeoutMs =
+    options.overallTimeoutMs ?? ESCROW_STREAMING_OVERALL_TIMEOUT_MS;
+  const initialPollDelayMs =
+    options.httpPollingIntervalMs ??
+    options.pollIntervalMs ??
+    options.minPollIntervalMs ??
+    ESCROW_MIN_POLL_INTERVAL_MS;
+  const maxPollIntervalMs =
+    options.maxPollIntervalMs ?? ESCROW_MAX_POLL_INTERVAL_MS;
+  const pollBackoffMultiplier =
+    options.pollBackoffMultiplier ?? ESCROW_POLL_BACKOFF_MULTIPLIER;
+  const lastValidBlockHeight = options.lastValidBlockHeight;
+  const targetCommitment = options.commitment ?? "finalized";
+  const now = options.now ?? Date.now;
+
+  let currentPollDelayMs = initialPollDelayMs;
+
+  const stateMachine = new EscrowConfirmationStateMachine(
+    cleanSignature,
+    options.callbacks,
+    now,
+  );
+
+  let confirmTimer: ReturnType<typeof setTimeout> | undefined;
+  let finalizeTimer: ReturnType<typeof setTimeout> | undefined;
+  let overallTimer: ReturnType<typeof setTimeout> | undefined;
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  let isUnsubscribed = false;
+  let isPollingActive = false;
+
+  let connection: Connection | null = options.connection ?? null;
+  const pool = options.pool ?? getEscrowRpcPool();
+
+  let processedSubId: number | undefined;
+  let confirmedSubId: number | undefined;
+  let finalizedSubId: number | undefined;
+  let subStateRemovers: Array<() => void> = [];
+
+  const cleanupListeners = () => {
+    for (const remover of subStateRemovers) {
+      try {
+        remover();
+      } catch {}
+    }
+    subStateRemovers = [];
+
+    if (connection) {
+      const activeConn = connection;
+      if (processedSubId !== undefined) {
+        const id = processedSubId;
+        processedSubId = undefined;
+        try {
+          void activeConn.removeSignatureListener(id);
+        } catch {}
+      }
+      if (confirmedSubId !== undefined) {
+        const id = confirmedSubId;
+        confirmedSubId = undefined;
+        try {
+          void activeConn.removeSignatureListener(id);
+        } catch {}
+      }
+      if (finalizedSubId !== undefined) {
+        const id = finalizedSubId;
+        finalizedSubId = undefined;
+        try {
+          void activeConn.removeSignatureListener(id);
+        } catch {}
+      }
+    }
+  };
+
+  const cleanupTimers = () => {
+    if (confirmTimer) {
+      clearTimeout(confirmTimer);
+      confirmTimer = undefined;
+    }
+    if (finalizeTimer) {
+      clearTimeout(finalizeTimer);
+      finalizeTimer = undefined;
+    }
+    if (overallTimer) {
+      clearTimeout(overallTimer);
+      overallTimer = undefined;
+    }
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = undefined;
+    }
+  };
+
+  const unsubscribe = () => {
+    if (isUnsubscribed) return;
+    isUnsubscribed = true;
+    cleanupTimers();
+    void cleanupListeners();
+    stateMachine.abort("Subscription unsubscribed by caller");
+  };
+
+  // Start overall timeout timer
+  overallTimer = setTimeout(() => {
+    if (stateMachine.isDone() || isUnsubscribed) return;
+    stateMachine.transition(
+      "timeout",
+      isPollingActive ? "http_polling" : "websocket",
+      {
+        error: `Confirmation timed out after ${overallTimeoutMs}ms`,
+      },
+    );
+    unsubscribe();
+  }, overallTimeoutMs);
+  overallTimer.unref?.();
+
+  // Helper to trigger HTTP fallback polling loop
+  const triggerHttpFallback = (reason?: string) => {
+    if (stateMachine.isDone() || isUnsubscribed || isPollingActive) return;
+    isPollingActive = true;
+    options.onWebSocketDisconnect?.(reason);
+    stateMachine.transition("fallback_polling", "http_polling", {
+      error: reason,
+    });
+    void pollOnce();
+  };
+
+  // Helper to check blockhash expiration
+  const checkBlockhashExpired = async (): Promise<boolean> => {
+    if (lastValidBlockHeight === undefined || lastValidBlockHeight === null) {
+      return false;
+    }
+    try {
+      let currentHeight: number;
+      if (connection) {
+        currentHeight = await connection.getBlockHeight(targetCommitment);
+      } else {
+        currentHeight = await pool.execute((conn) =>
+          conn.getBlockHeight(targetCommitment),
+        );
+      }
+      return currentHeight > lastValidBlockHeight;
+    } catch {
+      return false;
+    }
+  };
+
+  // Single status fetch shared by every polling path. Each request is bounded
+  // by a 5s abort deadline so a blackholed RPC node can never hang the loop;
+  // a timeout rejects and is handled by the caller like any other poll error.
+  const fetchSignatureStatus = (): Promise<SignatureStatus | null> =>
+    withRpcPollTimeout(
+      async () => {
+        if (options.pollSignatureStatus) {
+          return options.pollSignatureStatus(cleanSignature);
+        }
+        if (connection) {
+          const res = await connection.getSignatureStatuses([cleanSignature], {
+            searchTransactionHistory: true,
+          });
+          return res.value?.[0] ?? null;
+        }
+        const res = await pool.execute((conn) =>
+          conn.getSignatureStatuses([cleanSignature], {
+            searchTransactionHistory: true,
+          }),
+        );
+        return res.value?.[0] ?? null;
+      },
+      { endpoint: "escrow-confirmation-poll" },
+    );
+
+  // Helper to poll signature status once
+  const pollOnce = async () => {
+    if (stateMachine.isDone() || isUnsubscribed) return;
+
+    let status: SignatureStatus | null = null;
+    try {
+      status = await fetchSignatureStatus();
+    } catch (pollErr) {
+      console.warn(
+        `[EscrowStreaming] HTTP poll failed for ${cleanSignature}:`,
+        pollErr,
+      );
+      scheduleNextPoll();
+      return;
+    }
+
+    if (stateMachine.isDone() || isUnsubscribed) return;
+
+    if (status) {
+      if (status.err) {
+        stateMachine.transition("failed", "http_polling", {
+          slot: status.slot,
+          error:
+            typeof status.err === "string"
+              ? status.err
+              : JSON.stringify(status.err),
+        });
+        unsubscribe();
+        return;
+      }
+
+      const commitment = status.confirmationStatus;
+      if (commitment === "finalized" || status.confirmations === null) {
+        stateMachine.transition("finalized", "http_polling", {
+          slot: status.slot,
+        });
+        unsubscribe();
+        return;
+      }
+
+      if (commitment === "confirmed") {
+        stateMachine.transition("confirmed", "http_polling", {
+          slot: status.slot,
+        });
+
+        if (targetCommitment === "confirmed") {
+          unsubscribe();
+          return;
+        }
+
+        // Continue polling for finalization
+        if (!finalizeTimer) {
+          finalizeTimer = setTimeout(() => {
+            // Watchdog: If finalizeTimer expires, polling continues
+          }, finalizeTimeoutMs);
+          finalizeTimer.unref?.();
+        }
+      } else if (commitment === "processed") {
+        stateMachine.transition("processed", "http_polling", {
+          slot: status.slot,
+        });
+        if (targetCommitment === "processed") {
+          unsubscribe();
+          return;
+        }
+      }
+    } else {
+      // If status is not found, check if blockhash expired
+      const isExpired = await checkBlockhashExpired();
+      if (isExpired && !stateMachine.isDone() && !isUnsubscribed) {
+        let finalCheckSucceeded = false;
+        try {
+
+          let finalRes: SignatureStatus | null = null;
+          if (options.pollSignatureStatus) {
+            finalRes = await options.pollSignatureStatus(cleanSignature);
+            finalCheckSucceeded = true;
+          } else if (connection) {
+            const res = await connection.getSignatureStatuses(
+              [cleanSignature],
+              {
+                searchTransactionHistory: true,
+              },
+            );
+            finalRes = res.value?.[0] ?? null;
+            finalCheckSucceeded = true;
+          } else {
+            const res = await pool.execute((conn) =>
+              conn.getSignatureStatuses([cleanSignature], {
+                searchTransactionHistory: true,
+              }),
+            );
+            finalRes = res.value?.[0] ?? null;
+            finalCheckSucceeded = true;
+          }
+
+          const finalRes: SignatureStatus | null = await fetchSignatureStatus();
+          finalCheckSucceeded = true;
+
+
+          if (finalRes && !finalRes.err) {
+            const finalCommitment = finalRes.confirmationStatus;
+            if (
+              finalCommitment === "finalized" ||
+              finalRes.confirmations === null
+            ) {
+              stateMachine.transition("finalized", "http_polling", {
+                slot: finalRes.slot,
+              });
+              unsubscribe();
+              return;
+            } else if (finalCommitment === "confirmed") {
+              stateMachine.transition("confirmed", "http_polling", {
+                slot: finalRes.slot,
+              });
+              if (targetCommitment === "confirmed") {
+                unsubscribe();
+                return;
+              }
+            }
+          }
+        } catch {
+          finalCheckSucceeded = false;
+        }
+
+        if (finalCheckSucceeded && !stateMachine.isDone() && !isUnsubscribed) {
+          stateMachine.transition("timeout", "http_polling", {
+            error: `Transaction blockhash expired (current block height exceeded ${lastValidBlockHeight})`,
+          });
+          unsubscribe();
+          return;
+        }
+      }
+    }
+
+    scheduleNextPoll();
+  };
+
+  const scheduleNextPoll = () => {
+    if (stateMachine.isDone() || isUnsubscribed) return;
+    const delay = currentPollDelayMs;
+    // Exponential backoff
+    currentPollDelayMs = Math.min(
+      maxPollIntervalMs,
+      Math.round(currentPollDelayMs * pollBackoffMultiplier),
+    );
+
+    pollTimer = setTimeout(() => {
+      void pollOnce();
+    }, delay);
+    pollTimer.unref?.();
+  };
+
+  // Stage 1 Confirmation Watchdog (30s): If confirmed is not reached within 30s, activate HTTP fallback
+  confirmTimer = setTimeout(() => {
+    if (stateMachine.getCommitmentRank() < 2 && !stateMachine.isDone()) {
+      triggerHttpFallback("30-second WebSocket confirmation watchdog expired");
+    }
+  }, confirmTimeoutMs);
+  confirmTimer.unref?.();
+
+  const registerSubDisconnectListener = (conn: any, subId: number) => {
+    let wasSubscribed = false;
+    if (typeof conn._onSubscriptionStateChange === "function") {
+      try {
+        const remove = conn._onSubscriptionStateChange(
+          subId,
+          (state: string) => {
+            if (stateMachine.isDone() || isUnsubscribed) return;
+            if (state === "subscribed") {
+              wasSubscribed = true;
+            } else if (state === "error") {
+              triggerHttpFallback(
+                `WebSocket subscription ${subId} entered state 'error'`,
+              );
+            } else if (state === "pending" && wasSubscribed) {
+              // Only trigger fallback if subscription was previously active and dropped back to pending
+              triggerHttpFallback(
+                `WebSocket subscription ${subId} disconnected (dropped to 'pending')`,
+              );
+            }
+          },
+        );
+        if (typeof remove === "function") {
+          subStateRemovers.push(remove);
+        }
+      } catch {}
+    }
+  };
+
+  const setupListeners = (conn: Connection) => {
+    connection = conn;
+    if (stateMachine.isDone() || isUnsubscribed) return;
+
+    // Attach connection-level socket error/close listeners if present (for mock or custom providers)
+    const connAny = conn as any;
+    if (typeof connAny.on === "function") {
+      const onWsError = (err: any) => {
+        triggerHttpFallback(`WebSocket error: ${err?.message || err}`);
+      };
+      const onWsClose = () => {
+        triggerHttpFallback("WebSocket connection closed");
+      };
+      connAny.on("error", onWsError);
+      connAny.on("close", onWsClose);
+      connAny.on("disconnect", onWsClose);
+      subStateRemovers.push(() => {
+        try {
+          connAny.off?.("error", onWsError);
+          connAny.off?.("close", onWsClose);
+          connAny.off?.("disconnect", onWsClose);
+        } catch {}
+      });
+    }
+
+    // 1. Processed commitment listener
+    try {
+      processedSubId = conn.onSignatureWithOptions(
+        cleanSignature,
+        (notification, context) => {
+          if (stateMachine.isDone() || isUnsubscribed) return;
+          const err =
+            (notification as any)?.err ?? (notification as any)?.result?.err;
+          if (err) {
+            stateMachine.transition("failed", "websocket", {
+              slot: context?.slot,
+              error: typeof err === "string" ? err : JSON.stringify(err),
+            });
+            unsubscribe();
+            return;
+          }
+          stateMachine.transition("processed", "websocket", {
+            slot: context?.slot,
+          });
+          if (targetCommitment === "processed") {
+            unsubscribe();
+          }
+        },
+        { commitment: "processed" },
+      );
+      if (processedSubId !== undefined) {
+        registerSubDisconnectListener(conn, processedSubId);
+      }
+    } catch (e) {
+      console.warn(
+        "[EscrowStreaming] Failed to subscribe to processed notification:",
+        e,
+      );
+    }
+
+    // 2. Confirmed commitment listener
+    try {
+      confirmedSubId = conn.onSignatureWithOptions(
+        cleanSignature,
+        (notification, context) => {
+          if (stateMachine.isDone() || isUnsubscribed) return;
+          const err =
+            (notification as any)?.err ?? (notification as any)?.result?.err;
+          if (err) {
+            stateMachine.transition("failed", "websocket", {
+              slot: context?.slot,
+              error: typeof err === "string" ? err : JSON.stringify(err),
+            });
+            unsubscribe();
+            return;
+          }
+
+          // Clear Stage 1 confirmation watchdog
+          if (confirmTimer) {
+            clearTimeout(confirmTimer);
+            confirmTimer = undefined;
+          }
+
+          stateMachine.transition("confirmed", "websocket", {
+            slot: context?.slot,
+          });
+
+          if (targetCommitment === "confirmed") {
+            unsubscribe();
+            return;
+          }
+
+          // Start Stage 2 Finalization Watchdog (15s):
+          // If finalized is not received within 15s of confirmed, trigger HTTP polling
+          if (!finalizeTimer && !stateMachine.isDone()) {
+            finalizeTimer = setTimeout(() => {
+              if (
+                stateMachine.getCommitmentRank() < 3 &&
+                !stateMachine.isDone()
+              ) {
+                triggerHttpFallback(
+                  "15-second post-confirmation finalization watchdog expired",
+                );
+              }
+            }, finalizeTimeoutMs);
+            finalizeTimer.unref?.();
+          }
+        },
+        { commitment: "confirmed" },
+      );
+      if (confirmedSubId !== undefined) {
+        registerSubDisconnectListener(conn, confirmedSubId);
+      }
+    } catch (e) {
+      console.warn(
+        "[EscrowStreaming] Failed to subscribe to confirmed notification:",
+        e,
+      );
+    }
+
+    // 3. Finalized commitment listener
+    try {
+      finalizedSubId = conn.onSignatureWithOptions(
+        cleanSignature,
+        (notification, context) => {
+          if (stateMachine.isDone() || isUnsubscribed) return;
+          const err =
+            (notification as any)?.err ?? (notification as any)?.result?.err;
+          if (err) {
+            stateMachine.transition("failed", "websocket", {
+              slot: context?.slot,
+              error: typeof err === "string" ? err : JSON.stringify(err),
+            });
+            unsubscribe();
+            return;
+          }
+
+          stateMachine.transition("finalized", "websocket", {
+            slot: context?.slot,
+          });
+          unsubscribe();
+        },
+        { commitment: "finalized" },
+      );
+      if (finalizedSubId !== undefined) {
+        registerSubDisconnectListener(conn, finalizedSubId);
+      }
+    } catch (e) {
+      console.warn(
+        "[EscrowStreaming] Failed to subscribe to finalized notification:",
+        e,
+      );
+    }
+
+    // If all three subscriptions failed to register, fall back immediately to HTTP polling
+    if (
+      processedSubId === undefined &&
+      confirmedSubId === undefined &&
+      finalizedSubId === undefined
+    ) {
+      triggerHttpFallback(
+        "WebSocket subscription registration failed across all commitments",
+      );
+    }
+  };
+
+  // Initialize WebSocket subscriptions
+  if (connection) {
+    setupListeners(connection);
+  } else {
+    (async () => {
+      try {
+        let conn: Connection | undefined;
+        if (typeof (pool as any).getActiveConnection === "function") {
+          conn = await (pool as any).getActiveConnection();
+        } else if (typeof (pool as any).getConnection === "function") {
+          conn = await (pool as any).getConnection();
+        } else {
+          conn = await pool.execute((c) => Promise.resolve(c));
+        }
+
+        if (conn && !isUnsubscribed && !stateMachine.isDone()) {
+          setupListeners(conn);
+        }
+      } catch (connErr) {
+        console.warn(
+          "[EscrowStreaming] Failed to acquire connection for WebSocket subscription:",
+          connErr,
+        );
+        triggerHttpFallback(
+          "Failed to acquire connection for WebSocket subscription",
+        );
+      }
+    })();
+  }
+
+  return {
+    signature: cleanSignature,
+    getStatus: () => stateMachine.getStatus(),
+    getLatestEvent: () => stateMachine.getLatestEvent(),
+    unsubscribe,
+    promise: stateMachine.promise,
+  };
+}
+
 export * from "./solanaPayEscrow";
+export * from "./priorityFeeEstimator";
+export * from "./escrowTransactionRetry";
